@@ -5,24 +5,29 @@ import android.content.pm.ActivityInfo
 import android.graphics.Paint
 import android.os.Parcelable
 import android.util.SparseArray
-import android.util.TypedValue
 import android.view.View
 import android.view.ViewGroup
 import android.view.WindowManager
 import android.webkit.WebView
+import android.widget.ImageView
 import androidx.coordinatorlayout.widget.CoordinatorLayout
 import androidx.core.view.children
 import androidx.fragment.app.Fragment
+import androidx.swiperefreshlayout.widget.SwipeRefreshLayout
 import com.facebook.react.bridge.GuardedRunnable
 import com.facebook.react.bridge.ReactContext
 import com.facebook.react.uimanager.PixelUtil
 import com.facebook.react.uimanager.UIManagerHelper
 import com.facebook.react.uimanager.UIManagerModule
 import com.facebook.react.uimanager.events.EventDispatcher
-import com.facebook.react.views.scroll.ReactScrollView
 import com.google.android.material.bottomsheet.BottomSheetBehavior
+import com.google.android.material.shape.CornerFamily
+import com.google.android.material.shape.MaterialShapeDrawable
+import com.google.android.material.shape.ShapeAppearanceModel
 import com.swmansion.rnscreens.events.HeaderHeightChangeEvent
 import com.swmansion.rnscreens.events.SheetDetentChangedEvent
+import com.swmansion.rnscreens.ext.isInsideScrollViewWithRemoveClippedSubviews
+import java.lang.ref.WeakReference
 
 @SuppressLint("ViewConstructor") // Only we construct this view, it is never inflated.
 class Screen(
@@ -31,6 +36,8 @@ class Screen(
     ScreenContentWrapper.OnLayoutCallback {
     val fragment: Fragment?
         get() = fragmentWrapper?.fragment
+
+    var contentWrapper = WeakReference<ScreenContentWrapper>(null)
 
     val sheetBehavior: BottomSheetBehavior<Screen>?
         get() = (layoutParams as? CoordinatorLayout.LayoutParams)?.behavior as? BottomSheetBehavior<Screen>
@@ -54,10 +61,16 @@ class Screen(
 
     // Props for controlling modal presentation
     var isSheetGrabberVisible: Boolean = false
+
+    // corner radius must be updated after all props prop updates from a single transaction
+    // have been applied, because it depends on the presentation type.
+    private var shouldUpdateSheetCornerRadius = false
     var sheetCornerRadius: Float = 0F
         set(value) {
-            field = value
-            (fragment as? ScreenStackFragment)?.onSheetCornerRadiusChange()
+            if (field != value) {
+                field = value
+                shouldUpdateSheetCornerRadius = true
+            }
         }
     var sheetExpandsWhenScrolledToEdge: Boolean = true
 
@@ -118,6 +131,7 @@ class Screen(
 
     fun registerLayoutCallbackForWrapper(wrapper: ScreenContentWrapper) {
         wrapper.delegate = this
+        this.contentWrapper = WeakReference(wrapper)
     }
 
     override fun dispatchSaveInstanceState(container: SparseArray<Parcelable>) {
@@ -141,17 +155,14 @@ class Screen(
             val width = r - l
             val height = b - t
 
-            val headerHeight = calculateHeaderHeight()
-            val totalHeight =
-                headerHeight.first + headerHeight.second // action bar height + status bar height
             if (BuildConfig.IS_NEW_ARCHITECTURE_ENABLED) {
-                updateScreenSizeFabric(width, height, totalHeight)
+                updateScreenSizeFabric(width, height, t)
             } else {
                 updateScreenSizePaper(width, height)
             }
 
             footer?.onParentLayout(changed, l, t, r, b, container!!.height)
-            notifyHeaderHeightChange(totalHeight)
+            notifyHeaderHeightChange(t)
         }
     }
 
@@ -226,6 +237,9 @@ class Screen(
     fun setActivityState(activityState: ActivityState) {
         if (activityState == this.activityState) {
             return
+        }
+        if (container is ScreenStack && this.activityState != null && activityState < this.activityState!!) {
+            throw IllegalStateException("[RNScreens] activityState can only progress in NativeStack")
         }
         this.activityState = activityState
         container?.notifyChildUpdate()
@@ -368,7 +382,7 @@ class Screen(
         parent?.let {
             for (i in 0 until it.childCount) {
                 val child = it.getChildAt(i)
-                if (child.javaClass.simpleName.equals("CircleImageView")) {
+                if (parent is SwipeRefreshLayout && child is ImageView) {
                     // SwipeRefreshLayout class which has CircleImageView as a child,
                     // does not handle `startViewTransition` properly.
                     // It has a custom `getChildDrawingOrder` method which returns
@@ -386,10 +400,10 @@ class Screen(
                 }
                 if (child is ViewGroup) {
                     // The children are miscounted when there's a FlatList with
-                    // removeCLippedSubviews set to true (default).
+                    // removeClippedSubviews set to true (default).
                     // We add a simple view for each item in the list to make it work as expected.
-                    // See https://github.com/software-mansion/react-native-screens/issues/2282
-                    if (it is ReactScrollView && it.removeClippedSubviews) {
+                    // See https://github.com/software-mansion/react-native-screens/pull/2383
+                    if (child.isInsideScrollViewWithRemoveClippedSubviews()) {
                         for (j in 0 until child.childCount) {
                             child.addView(View(context))
                         }
@@ -400,32 +414,7 @@ class Screen(
         }
     }
 
-    private fun calculateHeaderHeight(): Pair<Double, Double> {
-        val actionBarTv = TypedValue()
-        val resolvedActionBarSize =
-            context.theme.resolveAttribute(android.R.attr.actionBarSize, actionBarTv, true)
-
-        // Check if it's possible to get an attribute from theme context and assign a value from it.
-        // Otherwise, the default value will be returned.
-        val actionBarHeight =
-            TypedValue
-                .complexToDimensionPixelSize(actionBarTv.data, resources.displayMetrics)
-                .takeIf { resolvedActionBarSize && headerConfig?.isHeaderHidden != true && headerConfig?.isHeaderTranslucent != true }
-                ?.let { PixelUtil.toDIPFromPixel(it.toFloat()).toDouble() } ?: 0.0
-
-        val statusBarHeight =
-            context.resources
-                .getIdentifier("status_bar_height", "dimen", "android")
-                // Count only status bar when action bar is visible and status bar is not hidden
-                .takeIf { it > 0 && isStatusBarHidden != true && actionBarHeight > 0 }
-                ?.let { (context.resources::getDimensionPixelSize)(it) }
-                ?.let { PixelUtil.toDIPFromPixel(it.toFloat()).toDouble() }
-                ?: 0.0
-
-        return actionBarHeight to statusBarHeight
-    }
-
-    private fun notifyHeaderHeightChange(headerHeight: Double) {
+    private fun notifyHeaderHeightChange(headerHeight: Int) {
         val screenContext = context as ReactContext
         val surfaceId = UIManagerHelper.getSurfaceId(screenContext)
         UIManagerHelper
@@ -448,6 +437,29 @@ class Screen(
         )
     }
 
+    internal fun onFinalizePropsUpdate() {
+        if (shouldUpdateSheetCornerRadius) {
+            shouldUpdateSheetCornerRadius = false
+            onSheetCornerRadiusChange()
+        }
+    }
+
+    internal fun onSheetCornerRadiusChange() {
+        if (stackPresentation !== StackPresentation.FORM_SHEET || background == null) {
+            return
+        }
+        (background as? MaterialShapeDrawable?)?.let {
+            val resolvedCornerRadius = PixelUtil.toDIPFromPixel(sheetCornerRadius)
+            it.shapeAppearanceModel =
+                ShapeAppearanceModel
+                    .Builder()
+                    .apply {
+                        setTopLeftCorner(CornerFamily.ROUNDED, resolvedCornerRadius)
+                        setTopRightCorner(CornerFamily.ROUNDED, resolvedCornerRadius)
+                    }.build()
+        }
+    }
+
     enum class StackPresentation {
         PUSH,
         MODAL,
@@ -463,7 +475,8 @@ class Screen(
         SLIDE_FROM_RIGHT,
         SLIDE_FROM_LEFT,
         FADE_FROM_BOTTOM,
-        IOS,
+        IOS_FROM_RIGHT,
+        IOS_FROM_LEFT,
     }
 
     enum class ReplaceAnimation {

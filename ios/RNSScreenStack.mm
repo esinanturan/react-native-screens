@@ -25,6 +25,7 @@
 #import "RNSScreenStackAnimator.h"
 #import "RNSScreenStackHeaderConfig.h"
 #import "RNSScreenWindowTraits.h"
+#import "utils/UINavigationBar+RNSUtility.h"
 
 #import "UIView+RNSUtility.h"
 
@@ -82,6 +83,8 @@ namespace react = facebook::react;
     if (![screenController hasNestedStack] && isNotDismissingModal) {
       [screenController calculateAndNotifyHeaderHeightChangeIsModal:NO];
     }
+
+    [self maybeUpdateHeaderInsetsInShadowTreeForScreen:screenController];
   }
 }
 
@@ -93,6 +96,35 @@ namespace react = facebook::react;
 - (UIViewController *)childViewControllerForHomeIndicatorAutoHidden
 {
   return [self topViewController];
+}
+
+- (void)maybeUpdateHeaderInsetsInShadowTreeForScreen:(RNSScreen *)screenController
+{
+  // This might happen e.g. if there is only native title present in navigation bar.
+  if (self.navigationBar.subviews.count < 2) {
+    return;
+  }
+
+  auto headerConfig = screenController.screenView.findHeaderConfig;
+  if (headerConfig == nil || !headerConfig.shouldHeaderBeVisible) {
+    return;
+  }
+
+  NSDirectionalEdgeInsets navBarMargins = [self.navigationBar directionalLayoutMargins];
+  NSDirectionalEdgeInsets navBarContentMargins =
+      [self.navigationBar.rnscreens_findContentView directionalLayoutMargins];
+
+  BOOL isDisplayingBackButton = [headerConfig shouldBackButtonBeVisibleInNavigationBar:self.navigationBar];
+
+  // 44.0 is just "closed eyes default". It is so on device I've tested with, nothing more.
+  UIView *barButtonView = isDisplayingBackButton ? self.navigationBar.rnscreens_findBackButtonWrapperView : nil;
+  CGFloat platformBackButtonWidth = barButtonView != nil ? barButtonView.frame.size.width : 44.0f;
+
+  [headerConfig updateHeaderInsetsInShadowTreeTo:NSDirectionalEdgeInsets{
+                                                     .leading = navBarMargins.leading + navBarContentMargins.leading +
+                                                         (isDisplayingBackButton ? platformBackButtonWidth : 0),
+                                                     .trailing = navBarMargins.trailing + navBarContentMargins.trailing,
+                                                 }];
 }
 #endif
 
@@ -123,6 +155,13 @@ namespace react = facebook::react;
 }
 
 #ifdef RCT_NEW_ARCH_ENABLED
+
+// Needed because of this: https://github.com/facebook/react-native/pull/37274
++ (void)load
+{
+  [super load];
+}
+
 - (instancetype)initWithFrame:(CGRect)frame
 {
   if (self = [super initWithFrame:frame]) {
@@ -506,13 +545,6 @@ namespace react = facebook::react;
       [changeRootController dismissViewControllerAnimated:shouldAnimate completion:finish];
       return;
     }
-
-    UIViewController *lastModalVc = [self lastFromPresentedViewControllerChainStartingFrom:firstModalToBeDismissed];
-
-    if (lastModalVc != firstModalToBeDismissed) {
-      [lastModalVc dismissViewControllerAnimated:shouldAnimate completion:finish];
-      return;
-    }
   }
 
   // changeRootController does not have presentedViewController but it does not mean that no modals are in presentation;
@@ -641,7 +673,7 @@ namespace react = facebook::react;
   NSMutableArray<UIViewController *> *pushControllers = [NSMutableArray new];
   NSMutableArray<UIViewController *> *modalControllers = [NSMutableArray new];
   for (RNSScreenView *screen in _reactSubviews) {
-    if (!screen.dismissed && screen.controller != nil) {
+    if (!screen.dismissed && screen.controller != nil && screen.activityState != RNSActivityStateInactive) {
       if (pushControllers.count == 0) {
         // first screen on the list needs to be places as "push controller"
         [pushControllers addObject:screen.controller];
@@ -915,6 +947,7 @@ namespace react = facebook::react;
 - (void)markChildUpdated
 {
   // do nothing
+  [self updateContainer];
 }
 
 - (void)didUpdateChildren
